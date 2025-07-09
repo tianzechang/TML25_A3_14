@@ -12,7 +12,7 @@ allowed_models = {
     "resnet34": models.resnet34,
     "resnet50": models.resnet50,
 }
-with open("robust_model_epoch_05.pt", "rb") as f:
+with open("robust_model.pt", "rb") as f:
     try:
         model: torch.nn.Module = allowed_models["resnet34"](weights=None)
         model.fc = torch.nn.Linear(model.fc.weight.shape[1], 10)
@@ -32,7 +32,7 @@ with open("robust_model_epoch_05.pt", "rb") as f:
 
 input()
 # Send the model to the server, replace the string "TOKEN" with the string of token provided to you
-response = requests.post("http://34.122.51.94:9090/robustness", files={"file": open("robust_model_epoch_05.pt", "rb")}, headers={"token": "34811541", "model-name": "resnet34"})
+response = requests.post("http://34.122.51.94:9090/robustness", files={"file": open("robust_model.pt", "rb")}, headers={"token": "34811541", "model-name": "resnet34"})
 
 # Should be 400, the clean accuracy is too low
 print(response.json())

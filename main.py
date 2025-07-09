@@ -2,25 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 train_robust.py
-Train a robust classifier against FGSM/PGD attacks and export the model for submission.
+Train a robust classifier against FGSM / PGD attacks and export a submission-ready model.
 """
 
-import argparse
-import random
-import sys
+import argparse, json, random, time, math
 from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from torch.utils.data import Dataset
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from torchvision import transforms, models
+from PIL import Image
 
-# ---------- Dataset ----------
+
 class TaskDataset(Dataset):
     def __init__(self, transform=None):
         self.ids, self.imgs, self.labels = [], [], []
@@ -46,83 +45,85 @@ class MembershipDataset(TaskDataset):
         return id_, img, label, self.membership[index]
 
 
+import sys
 sys.modules['__main__'].MembershipDataset = MembershipDataset
 
-# ---------- Argument Parser ----------
+# ---------- 1. Argument parsing ----------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, default="Train.pt", help="Training set path (.pt)")
-    p.add_argument("--out", type=str, default="robust_model.pt", help="Output filename (.pt)")
+    p.add_argument("--data", type=str, default="Train.pt",
+                   help="Path to training dataset (torch.save format)")
+    p.add_argument("--out", type=str, default="robust_model.pt",
+                   help="Output filename (.pt)")
     p.add_argument("--model", type=str, default="resnet34",
-                   choices=["resnet18", "resnet34", "resnet50"], help="Model architecture")
-    p.add_argument("--token", type=str, default="34811541", help="Token assigned for evaluation")
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch_size", type=int, default=64)
+                   choices=["resnet18", "resnet34", "resnet50"])
+    p.add_argument("--token", type=str, default="34811541",
+                   help="Evaluation token assigned by server")
+    p.add_argument("--epochs", type=int, default=25)
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-3)
-    p.add_argument("--eps", type=float, default=8/255, help="FGSM/PGD epsilon")
-    p.add_argument("--alpha", type=float, default=2/255, help="PGD step size or FGSM step")
-    p.add_argument("--pgd_steps", type=int, default=7, help="Number of PGD iterations")
+    p.add_argument("--eps", type=float, default=8/255,
+                   help="PGD/FGSM epsilon")
+    p.add_argument("--alpha", type=float, default=2/255,
+                   help="PGD step size; used for Fast AT as well")
+    p.add_argument("--pgd_steps", type=int, default=7,
+                   help="Number of PGD iterations")
     p.add_argument("--method", choices=["pgd", "fast"], default="pgd",
                    help="pgd = Madry PGD-AT | fast = Fast FGSM-AT")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
-# ---------- Data Loading ----------
+# ---------- 2. Dataset ----------
 def get_loaders(dataset_path, batch_size):
     dataset = torch.load(dataset_path, weights_only=False)
     print(f"Dataset length: {len(dataset)}")
-    print("Example sample:", dataset[0])
+    print("Example sample:")
+    print(dataset[0])
 
-    _, img, _, *_ = dataset[0]
+    _, img, label, *_ = dataset[0]
     if isinstance(img, Image.Image):
-        print("Image is PIL, converting to tensor.")
+        print("Image is PIL. Will apply ToTensor.")
     elif isinstance(img, torch.Tensor):
-        print("Image is tensor:", img.shape)
+        print("Image is already a tensor:", img.shape)
     else:
-        print("Unknown image type:", type(img))
+        print("Image type:", type(img))
 
     print("Image size:", np.array(img).shape if isinstance(img, np.ndarray) else img.size)
-    input()
-
-    mean = [0.2980, 0.2962, 0.2987]
-    std = [0.2886, 0.2875, 0.2889]
 
     train_tf = transforms.Compose([
         transforms.Lambda(lambda img: img.convert("RGB")),
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
     ])
     test_tf = transforms.Compose([
         transforms.Lambda(lambda img: img.convert("RGB")),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
     ])
 
     dataset.transform = train_tf
     train_loader = DataLoader(dataset, batch_size=batch_size,
                               shuffle=True, num_workers=0, pin_memory=False)
 
-    val_size = max(1, len(dataset) // 20)
-    indices = np.random.choice(len(dataset), size=val_size, replace=False)
+    subset_size = max(1, len(dataset) // 20)
+    indices = np.random.choice(len(dataset), size=subset_size, replace=False)
     val_ds = torch.utils.data.Subset(dataset, indices)
     val_ds.dataset.transform = test_tf
     val_loader = DataLoader(val_ds, batch_size=256,
                             shuffle=False, num_workers=0, pin_memory=False)
     return train_loader, val_loader
 
-# ---------- Model ----------
+# ---------- 3. Model ----------
 def get_model(name):
     assert name in ["resnet18", "resnet34", "resnet50"]
     model_ctor = getattr(models, name)
-    net = model_ctor(weights=None, num_classes=10)
-    net.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    net.maxpool = nn.Identity()
+    net = model_ctor(weights=None)
+    net.fc = nn.Linear(net.fc.in_features, 10)
     return net
 
-# ---------- Adversarial Attack ----------
-def fgsm(model, x, y, eps):
+# ---------- 4. Adversarial Attacks ----------
+def fgsm_rs(model, x, y, eps):
+    x_adv = x + torch.empty_like(x).uniform_(-eps, eps)
     x_adv = x.clone().detach().requires_grad_(True)
     logits = model(x_adv)
     loss = F.cross_entropy(logits, y)
@@ -144,7 +145,7 @@ def pgd(model, x, y, eps, alpha, steps):
             x_adv = (x + eta).clamp(0, 1).detach()
     return x_adv
 
-# ---------- Evaluation ----------
+# ---------- 5. Evaluation ----------
 def eval_acc(model, loader, device, attack=None, **atk_kwargs):
     model.eval()
     correct, total = 0, 0
@@ -158,74 +159,96 @@ def eval_acc(model, loader, device, attack=None, **atk_kwargs):
         total += labels.size(0)
     return correct / total
 
-# ---------- Training ----------
-warm_up = 3
+# ---------- 6. Training Loop ----------
+warm_up = 5
+fast_epochs = 15
 
 def train(args):
     torch.manual_seed(args.seed)
     device = (
         torch.device("cuda") if torch.cuda.is_available() else
-        torch.device("mps") if torch.backends.mps.is_available() else
+        torch.device("mps")  if torch.backends.mps.is_available() else
         torch.device("cpu")
     )
     device = torch.device("mps")
     print("Device:", device)
 
     train_loader, val_loader = get_loaders(args.data, args.batch_size)
+
+    
     model = get_model(args.model).to(device)
+    
+    clean_acc = eval_acc(model, val_loader, device)
+    fgsm_acc  = eval_acc(model, val_loader, device, attack=fgsm_rs, eps=args.eps)
+    pgd_acc   = eval_acc(model, val_loader, device, attack=pgd, eps=args.eps,
+                         alpha=args.alpha, steps=2)
+    print(f"Clean {clean_acc*100:.2f}% | FGSM {fgsm_acc*100:.2f}% | PGD {pgd_acc*100:.2f}%")
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
                                 momentum=0.9, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     for ep in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {ep:02d}", leave=False)
+
+        if ep < warm_up:
+            print("Clean training")
+        elif ep > fast_epochs:
+            print("PGD training")
+        else:
+            print("FGSM training")
+
         for _, imgs, labels in pbar:
             imgs, labels = imgs.to(device), labels.to(device)
 
             if ep < warm_up:
                 imgs_adv = imgs
-            elif args.method == "pgd":
-                imgs_adv = pgd(model, imgs, labels, eps=args.eps,
-                               alpha=args.alpha, steps=args.pgd_steps)
+            elif ep > fast_epochs:
+                imgs_adv = pgd(model, imgs, labels,
+                               eps=4/255, alpha=args.alpha, steps=4)
             else:
-                imgs_adv = fgsm(model, imgs, labels, eps=args.alpha)
+                imgs_adv = fgsm_rs(model, imgs, labels, eps=2/255)
 
+            logits_adv   = model(imgs_adv)
             logits_clean = model(imgs)
-            logits_adv = model(imgs_adv)
 
-            loss_clean = F.cross_entropy(logits_clean, labels)
             loss_adv = F.cross_entropy(logits_adv, labels)
+            loss_clean = F.cross_entropy(logits_clean, labels)
             loss = 0.5 * loss_clean + 0.5 * loss_adv
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            pbar.set_postfix({"loss": f"{loss.item():.3f}"})
 
+            pbar.set_postfix({"loss": f"{loss.item():.3f}"})
         scheduler.step()
 
         clean_acc = eval_acc(model, val_loader, device)
-        fgsm_acc = eval_acc(model, val_loader, device, attack=fgsm, eps=args.eps)
-        pgd_acc = eval_acc(model, val_loader, device, attack=pgd,
-                           eps=args.eps, alpha=args.alpha, steps=args.pgd_steps)
-        print(f"[Epoch {ep:02d}] Clean: {clean_acc*100:.2f}% | "
-              f"FGSM: {fgsm_acc*100:.2f}% | PGD: {pgd_acc*100:.2f}%")
+        fgsm_acc  = eval_acc(model, val_loader, device, attack=fgsm_rs, eps=args.eps)
+        pgd_acc   = eval_acc(model, val_loader, device, attack=pgd, eps=args.eps,
+                             alpha=args.alpha, steps=args.pgd_steps)
+        print(f"[E{ep:02d}] Clean {clean_acc*100:.2f}% | FGSM {fgsm_acc*100:.2f}% | PGD {pgd_acc*100:.2f}%")
 
+        model.eval()
         with torch.no_grad():
-            model.eval()
             dummy = torch.randn(1, 3, 32, 32).to(device)
             out = model(dummy)
-            assert out.shape == (1, 10), "Output shape must be (1, 10)"
+            assert out.shape == (1, 10), "Output dimension must be 10"
 
         export_name = f"robust_model_epoch_{ep:02d}.pt"
         torch.save(model.cpu().state_dict(), export_name)
         print(f"✔ Model saved to {export_name}")
         model.to(device)
 
-# ---------- Entry ----------
+    # Verification
+    reload = torch.load(args.out)
+    m2 = get_model(reload["model-name"])
+    m2.load_state_dict(reload["state_dict"], strict=True)
+    m2.eval()
+    print("Reloaded model successfully ✅")
+
+# ---------- 9. Entry ----------
 if __name__ == "__main__":
     args = parse_args()
     train(args)
