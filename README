@@ -1,0 +1,27 @@
+# TML25 Assignment 3 – Robustness
+
+This repository contains the code and model for Assignment 3 of the **Trustworthy Machine Learning (SS 2025)** course.  
+The task is to train a robust image classifier that performs well on both clean and adversarial examples (FGSM and PGD).
+
+## Files
+
+- `main.py`  
+  Trains a robust ResNet classifier on the provided dataset using PGD or FGSM adversarial training.  
+  The script exports `.pt` model files compatible with the evaluation server.
+
+- `submission.py`  
+  Used to locally validate and submit the exported model to the evaluation server.  
+  Includes basic checks for model architecture and output shape.
+
+- `report.pdf`
+
+## Model
+
+- Model type: One of `resnet18`, `resnet34`, or `resnet50` (default: `resnet34`)
+- Input shape: **3×32×32**
+- Output: **10 classes**
+
+## Output
+
+- The training script (`main.py`) saves model checkpoints as `.pt` files .
+
